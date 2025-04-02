@@ -1,21 +1,29 @@
-from __future__ import absolute_import
+import pickle
 
-from apscheduler.jobstores.base import BaseJobStore, JobLookupError, ConflictingIdError
-from apscheduler.util import maybe_ref, datetime_to_utc_timestamp, utc_timestamp_to_datetime
 from apscheduler.job import Job
-
-try:
-    import cPickle as pickle
-except ImportError:  # pragma: nocover
-    import pickle
+from apscheduler.jobstores.base import BaseJobStore, ConflictingIdError, JobLookupError
+from apscheduler.util import (
+    datetime_to_utc_timestamp,
+    maybe_ref,
+    utc_timestamp_to_datetime,
+)
 
 try:
     from sqlalchemy import (
-        create_engine, Table, Column, MetaData, Unicode, Float, LargeBinary, select)
+        Column,
+        Float,
+        LargeBinary,
+        MetaData,
+        Table,
+        Unicode,
+        and_,
+        create_engine,
+        select,
+    )
     from sqlalchemy.exc import IntegrityError
     from sqlalchemy.sql.expression import null
-except ImportError:  # pragma: nocover
-    raise ImportError('SQLAlchemyJobStore requires SQLAlchemy installed')
+except ImportError as exc:  # pragma: nocover
+    raise ImportError("SQLAlchemyJobStore requires SQLAlchemy installed") from exc
 
 
 class SQLAlchemyJobStore(BaseJobStore):
@@ -40,9 +48,17 @@ class SQLAlchemyJobStore(BaseJobStore):
         (ignored if ``engine`` is given)
     """
 
-    def __init__(self, url=None, engine=None, tablename='apscheduler_jobs', metadata=None,
-                 pickle_protocol=pickle.HIGHEST_PROTOCOL, tableschema=None, engine_options=None):
-        super(SQLAlchemyJobStore, self).__init__()
+    def __init__(
+        self,
+        url=None,
+        engine=None,
+        tablename="apscheduler_jobs",
+        metadata=None,
+        pickle_protocol=pickle.HIGHEST_PROTOCOL,
+        tableschema=None,
+        engine_options=None,
+    ):
+        super().__init__()
         self.pickle_protocol = pickle_protocol
         metadata = maybe_ref(metadata) or MetaData()
 
@@ -56,32 +72,38 @@ class SQLAlchemyJobStore(BaseJobStore):
         # 191 = max key length in MySQL for InnoDB/utf8mb4 tables,
         # 25 = precision that translates to an 8-byte float
         self.jobs_t = Table(
-            tablename, metadata,
-            Column('id', Unicode(191, _warn_on_bytestring=False), primary_key=True),
-            Column('next_run_time', Float(25), index=True),
-            Column('job_state', LargeBinary, nullable=False),
-            schema=tableschema
+            tablename,
+            metadata,
+            Column("id", Unicode(191), primary_key=True),
+            Column("next_run_time", Float(25), index=True),
+            Column("job_state", LargeBinary, nullable=False),
+            schema=tableschema,
         )
 
     def start(self, scheduler, alias):
-        super(SQLAlchemyJobStore, self).start(scheduler, alias)
+        super().start(scheduler, alias)
         self.jobs_t.create(self.engine, True)
 
     def lookup_job(self, job_id):
-        selectable = select([self.jobs_t.c.job_state]).where(self.jobs_t.c.id == job_id)
-        job_state = self.engine.execute(selectable).scalar()
-        return self._reconstitute_job(job_state) if job_state else None
+        selectable = select(self.jobs_t.c.job_state).where(self.jobs_t.c.id == job_id)
+        with self.engine.begin() as connection:
+            job_state = connection.execute(selectable).scalar()
+            return self._reconstitute_job(job_state) if job_state else None
 
     def get_due_jobs(self, now):
         timestamp = datetime_to_utc_timestamp(now)
         return self._get_jobs(self.jobs_t.c.next_run_time <= timestamp)
 
     def get_next_run_time(self):
-        selectable = select([self.jobs_t.c.next_run_time]).\
-            where(self.jobs_t.c.next_run_time != null()).\
-            order_by(self.jobs_t.c.next_run_time).limit(1)
-        next_run_time = self.engine.execute(selectable).scalar()
-        return utc_timestamp_to_datetime(next_run_time)
+        selectable = (
+            select(self.jobs_t.c.next_run_time)
+            .where(self.jobs_t.c.next_run_time != null())
+            .order_by(self.jobs_t.c.next_run_time)
+            .limit(1)
+        )
+        with self.engine.begin() as connection:
+            next_run_time = connection.execute(selectable).scalar()
+            return utc_timestamp_to_datetime(next_run_time)
 
     def get_all_jobs(self):
         jobs = self._get_jobs()
@@ -89,41 +111,53 @@ class SQLAlchemyJobStore(BaseJobStore):
         return jobs
 
     def add_job(self, job):
-        insert = self.jobs_t.insert().values(**{
-            'id': job.id,
-            'next_run_time': datetime_to_utc_timestamp(job.next_run_time),
-            'job_state': pickle.dumps(job.__getstate__(), self.pickle_protocol)
-        })
-        try:
-            self.engine.execute(insert)
-        except IntegrityError:
-            raise ConflictingIdError(job.id)
+        insert = self.jobs_t.insert().values(
+            **{
+                "id": job.id,
+                "next_run_time": datetime_to_utc_timestamp(job.next_run_time),
+                "job_state": pickle.dumps(job.__getstate__(), self.pickle_protocol),
+            }
+        )
+        with self.engine.begin() as connection:
+            try:
+                connection.execute(insert)
+            except IntegrityError:
+                raise ConflictingIdError(job.id)
 
     def update_job(self, job):
-        update = self.jobs_t.update().values(**{
-            'next_run_time': datetime_to_utc_timestamp(job.next_run_time),
-            'job_state': pickle.dumps(job.__getstate__(), self.pickle_protocol)
-        }).where(self.jobs_t.c.id == job.id)
-        result = self.engine.execute(update)
-        if result.rowcount == 0:
-            raise JobLookupError(job.id)
+        update = (
+            self.jobs_t.update()
+            .values(
+                **{
+                    "next_run_time": datetime_to_utc_timestamp(job.next_run_time),
+                    "job_state": pickle.dumps(job.__getstate__(), self.pickle_protocol),
+                }
+            )
+            .where(self.jobs_t.c.id == job.id)
+        )
+        with self.engine.begin() as connection:
+            result = connection.execute(update)
+            if result.rowcount == 0:
+                raise JobLookupError(job.id)
 
     def remove_job(self, job_id):
         delete = self.jobs_t.delete().where(self.jobs_t.c.id == job_id)
-        result = self.engine.execute(delete)
-        if result.rowcount == 0:
-            raise JobLookupError(job_id)
+        with self.engine.begin() as connection:
+            result = connection.execute(delete)
+            if result.rowcount == 0:
+                raise JobLookupError(job_id)
 
     def remove_all_jobs(self):
         delete = self.jobs_t.delete()
-        self.engine.execute(delete)
+        with self.engine.begin() as connection:
+            connection.execute(delete)
 
     def shutdown(self):
         self.engine.dispose()
 
     def _reconstitute_job(self, job_state):
         job_state = pickle.loads(job_state)
-        job_state['jobstore'] = self
+        job_state["jobstore"] = self
         job = Job.__new__(Job)
         job.__setstate__(job_state)
         job._scheduler = self._scheduler
@@ -132,23 +166,29 @@ class SQLAlchemyJobStore(BaseJobStore):
 
     def _get_jobs(self, *conditions):
         jobs = []
-        selectable = select([self.jobs_t.c.id, self.jobs_t.c.job_state]).\
-            order_by(self.jobs_t.c.next_run_time)
-        selectable = selectable.where(*conditions) if conditions else selectable
+        selectable = select(self.jobs_t.c.id, self.jobs_t.c.job_state).order_by(
+            self.jobs_t.c.next_run_time
+        )
+        selectable = selectable.where(and_(*conditions)) if conditions else selectable
         failed_job_ids = set()
-        for row in self.engine.execute(selectable):
-            try:
-                jobs.append(self._reconstitute_job(row.job_state))
-            except BaseException:
-                self._logger.exception('Unable to restore job "%s" -- removing it', row.id)
-                failed_job_ids.add(row.id)
+        with self.engine.begin() as connection:
+            for row in connection.execute(selectable):
+                try:
+                    jobs.append(self._reconstitute_job(row.job_state))
+                except BaseException:
+                    self._logger.exception(
+                        'Unable to restore job "%s" -- removing it', row.id
+                    )
+                    failed_job_ids.add(row.id)
 
-        # Remove all the jobs we failed to restore
-        if failed_job_ids:
-            delete = self.jobs_t.delete().where(self.jobs_t.c.id.in_(failed_job_ids))
-            self.engine.execute(delete)
+            # Remove all the jobs we failed to restore
+            if failed_job_ids:
+                delete = self.jobs_t.delete().where(
+                    self.jobs_t.c.id.in_(failed_job_ids)
+                )
+                connection.execute(delete)
 
         return jobs
 
     def __repr__(self):
-        return '<%s (url=%s)>' % (self.__class__.__name__, self.engine.url)
+        return f"<{self.__class__.__name__} (url={self.engine.url})>"

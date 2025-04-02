@@ -11,7 +11,8 @@ __pycache__/
 
 # 📂 Данные и сигналы
 *.json
-signals/
+bot/signals/
+!bot/signals/*.py
 data/
 historical_data/
 
